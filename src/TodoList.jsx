@@ -1,30 +1,17 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
+import { requestTasks } from "./api.js";
 
-const storageKey = "simple-todo-tasks";
 const priorities = ["Low", "Medium", "High"];
 
-// Read saved tasks once when the app opens.
-function loadTasks() {
-  try {
-    const savedTasks = JSON.parse(localStorage.getItem(storageKey) || "[]");
-    if (!Array.isArray(savedTasks)) return [];
-    return savedTasks.filter((task) =>
-      task && typeof task.id === "string"
-      && typeof task.text === "string" && task.text.trim()
-      && typeof task.completed === "boolean"
-    ).map((task) => ({
-      ...task,
-      // Older saved tasks did not have a priority.
-      priority: priorities.includes(task.priority) ? task.priority : "Medium",
-    }));
-  } catch {
-    return [];
-  }
-}
-
 export default function TodoList() {
-  const [tasks, setTasks] = useState(loadTasks);
-  const [storageError, setStorageError] = useState(false);
+  const [tasks, setTasks] = useState([]);
+  const [summary, setSummary] = useState({ total: 0, completed: 0, remaining: 0 });
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [loadError, setLoadError] = useState("");
+  const [actionError, setActionError] = useState("");
+  const [refresh, setRefresh] = useState(0);
+  const savingRef = useRef(false);
   const [taskText, setTaskText] = useState("");
   const [newPriority, setNewPriority] = useState("Medium");
   const [search, setSearch] = useState("");
@@ -32,35 +19,68 @@ export default function TodoList() {
   const [editingId, setEditingId] = useState(null);
   const [editText, setEditText] = useState("");
 
-  // Save after adding, editing, completing, or deleting tasks.
+  // Search and status filtering happen on the server. Cancel obsolete searches.
   useEffect(() => {
-    try {
-      localStorage.setItem(storageKey, JSON.stringify(tasks));
-      setStorageError(false);
-    } catch {
-      setStorageError(true);
-    }
-  }, [tasks]);
+    const controller = new AbortController();
+    let active = true;
+    setLoading(true);
+    setLoadError("");
+    const timer = setTimeout(async () => {
+      try {
+        const query = new URLSearchParams({ search, status: filter });
+        const data = await requestTasks(`?${query}`, { signal: controller.signal });
+        if (active) {
+          setTasks(data.tasks);
+          setSummary(data.summary);
+        }
+      } catch (error) {
+        if (active && error.name !== "AbortError") setLoadError(error.message);
+      } finally {
+        if (active) setLoading(false);
+      }
+    }, 200);
+    return () => {
+      active = false;
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [search, filter, refresh]);
 
-  function addTask(event) {
+  // Only report success after the server has saved the change to disk.
+  async function changeTask(path, method, body) {
+    if (savingRef.current || loading || loadError) return false;
+    savingRef.current = true;
+    setSaving(true);
+    setActionError("");
+    try {
+      await requestTasks(path, {
+        method,
+        ...(body ? { body: JSON.stringify(body) } : {}),
+      });
+      setLoading(true);
+      setRefresh((value) => value + 1);
+      return true;
+    } catch (error) {
+      setActionError(error.message);
+      return false;
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
+    }
+  }
+
+  async function addTask(event) {
     event.preventDefault();
     const text = taskText.trim();
     if (!text) return;
 
-    const newTask = {
-      id: crypto.randomUUID(),
-      text,
-      completed: false,
-      priority: newPriority,
-    };
-    setTasks([...tasks, newTask]);
-    setTaskText("");
+    if (await changeTask("", "POST", { text, priority: newPriority })) {
+      setTaskText("");
+    }
   }
 
-  function toggleTask(id) {
-    setTasks(tasks.map((task) =>
-      task.id === id ? { ...task, completed: !task.completed } : task
-    ));
+  function toggleTask(task) {
+    changeTask(`/${task.id}`, "PATCH", { completed: !task.completed });
   }
 
   function startEditing(task) {
@@ -69,9 +89,7 @@ export default function TodoList() {
   }
 
   function changePriority(id, priority) {
-    setTasks(tasks.map((task) =>
-      task.id === id ? { ...task, priority } : task
-    ));
+    changeTask(`/${id}`, "PATCH", { priority });
   }
 
   function cancelEditing() {
@@ -79,44 +97,43 @@ export default function TodoList() {
     setEditText("");
   }
 
-  function saveTask(event, id) {
+  async function saveTask(event, id) {
     event.preventDefault();
     const text = editText.trim();
     if (!text) return;
 
-    setTasks(tasks.map((task) => task.id === id ? { ...task, text } : task));
-    cancelEditing();
+    if (await changeTask(`/${id}`, "PATCH", { text })) cancelEditing();
   }
 
-  function deleteTask(id) {
-    setTasks(tasks.filter((task) => task.id !== id));
-    if (editingId === id) cancelEditing();
+  async function deleteTask(id) {
+    if (await changeTask(`/${id}`, "DELETE")) {
+      if (editingId === id) cancelEditing();
+    }
   }
 
-  function clearAllTasks() {
-    setTasks([]);
-    cancelEditing();
+  async function clearAllTasks() {
+    if (await changeTask("", "DELETE")) cancelEditing();
   }
 
-  // A task must match BOTH the search text and the selected status.
-  const visibleTasks = tasks.filter((task) => {
-    const matchesSearch = task.text.toLowerCase().includes(search.trim().toLowerCase());
-    const matchesStatus = filter === "All"
-      || (filter === "Completed" && task.completed)
-      || (filter === "Uncompleted" && !task.completed);
-    return matchesSearch && matchesStatus;
-  });
-
-  const completedCount = tasks.filter((task) => task.completed).length;
+  const busy = loading || saving || Boolean(loadError);
 
   return (
     <>
       <section className="task-panel" aria-label="Manage tasks">
+        {actionError && <p className="error" role="alert">{actionError}</p>}
+        {loadError && (
+          <div className="error" role="alert">
+            <p>{loadError}</p>
+            <button type="button" onClick={() => setRefresh((value) => value + 1)}>Retry</button>
+          </div>
+        )}
         <form onSubmit={addTask}>
           <label htmlFor="new-task">New task</label>
           <div className="add-row">
             <input
               id="new-task"
+              maxLength={200}
+              disabled={saving}
               value={taskText}
               onChange={(event) => setTaskText(event.target.value)}
               placeholder="Enter a task"
@@ -124,6 +141,7 @@ export default function TodoList() {
             />
             <select
               aria-label="New task priority"
+              disabled={saving}
               value={newPriority}
               onChange={(event) => setNewPriority(event.target.value)}
             >
@@ -131,7 +149,7 @@ export default function TodoList() {
                 <option key={priority} value={priority}>{priority}</option>
               ))}
             </select>
-            <button className="add-button" disabled={!taskText.trim()}>Add</button>
+            <button className="add-button" disabled={busy || !taskText.trim()}>Add</button>
           </div>
         </form>
 
@@ -139,6 +157,8 @@ export default function TodoList() {
           <label htmlFor="search">Search tasks</label>
           <input
             id="search"
+            maxLength={200}
+            disabled={saving}
             type="search"
             value={search}
             onChange={(event) => setSearch(event.target.value)}
@@ -150,6 +170,7 @@ export default function TodoList() {
           {["All", "Completed", "Uncompleted"].map((status) => (
             <button
               key={status}
+              disabled={saving}
               type="button"
               aria-pressed={filter === status}
               onClick={() => setFilter(status)}
@@ -161,20 +182,22 @@ export default function TodoList() {
             type="button"
             className="delete-button"
             onClick={clearAllTasks}
-            disabled={tasks.length === 0}
+            disabled={busy || summary.total === 0}
           >
             Clear all
           </button>
         </div>
 
-        {visibleTasks.length > 0 ? (
+        {loading ? <p role="status">Loading tasks…</p> : loadError ? null : tasks.length > 0 ? (
           <ul className="task-list">
-            {visibleTasks.map((task) => (
+            {tasks.map((task) => (
               <li className="task-row" key={task.id}>
                 {editingId === task.id ? (
                   <form className="edit-form" onSubmit={(event) => saveTask(event, task.id)}>
                     <input
                       aria-label="Edit task"
+                      maxLength={200}
+                      disabled={saving}
                       value={editText}
                       onChange={(event) => setEditText(event.target.value)}
                       onKeyDown={(event) => {
@@ -182,26 +205,28 @@ export default function TodoList() {
                       }}
                       autoFocus
                     />
-                    <button type="submit" disabled={!editText.trim()}>Save</button>
-                    <button type="button" onClick={cancelEditing}>Cancel</button>
+                    <button type="submit" disabled={busy || !editText.trim()}>Save</button>
+                    <button type="button" disabled={saving} onClick={cancelEditing}>Cancel</button>
                   </form>
                 ) : (
                   <>
                     <label className={task.completed ? "task completed" : "task"}>
                       <input
                         type="checkbox"
+                        disabled={busy}
                         checked={task.completed}
-                        onChange={() => toggleTask(task.id)}
+                        onChange={() => toggleTask(task)}
                       />
                       <span>{task.text}</span>
                     </label>
-                    <button type="button" onClick={() => startEditing(task)}>
+                    <button type="button" disabled={busy} onClick={() => startEditing(task)}>
                       Edit
                     </button>
                   </>
                 )}
                 <select
                   aria-label={`Priority for ${task.text}`}
+                  disabled={busy}
                   value={task.priority}
                   onChange={(event) => changePriority(task.id, event.target.value)}
                 >
@@ -209,7 +234,7 @@ export default function TodoList() {
                     <option key={priority} value={priority}>{priority}</option>
                   ))}
                 </select>
-                <button type="button" className="delete-button" onClick={() => deleteTask(task.id)}>
+                <button type="button" disabled={busy} className="delete-button" onClick={() => deleteTask(task.id)}>
                   Delete
                 </button>
               </li>
@@ -217,21 +242,23 @@ export default function TodoList() {
           </ul>
         ) : (
           <div className="empty-state" role="status">
-            <p>{tasks.length === 0
+            <p>{summary.total === 0
               ? "No tasks yet."
               : "No matching tasks. Try another search or filter."}</p>
           </div>
         )}
 
-        <footer aria-live="polite">
-          <span>{tasks.length - completedCount} remaining</span>
-          <span>{completedCount} of {tasks.length} completed</span>
-        </footer>
+        {!loading && !loadError && (
+          <footer aria-live="polite">
+            <span>{summary.remaining} remaining</span>
+            <span>{summary.completed} of {summary.total} completed</span>
+          </footer>
+        )}
       </section>
       <p className="session-note" role="status">
-        {storageError
-          ? "Your browser could not save your tasks. Keep this page open to avoid losing changes."
-          : "Tasks are saved in this browser, even after refreshing."}
+        {saving ? "Saving changes…" : loadError || actionError
+          ? "Check the error above before retrying."
+          : "Tasks are saved on the server, even after refreshing."}
       </p>
     </>
   );
