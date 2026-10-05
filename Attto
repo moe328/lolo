@@ -1,0 +1,42 @@
+const express = require("express");
+const fs = require("fs");
+
+const app = express();
+
+app.use(express.json());
+
+app.post("/api/todos", (req, res) => {
+  const data = JSON.parse(fs.readFileSync("data.json", "utf8"));
+
+  const newId = data.length > 0
+    ? Math.max(...data.map(todo => todo.id)) + 1
+    : 1;
+
+  const newTodo = {
+    id: newId,
+    task: req.body.task,
+    priority: req.body.priority,
+    completed: req.body.completed
+  };
+
+  data.push(newTodo);
+
+  fs.writeFileSync(
+    "data.json",
+    JSON.stringify(data, null, 2)
+  );
+
+  res.status(201).json(newTodo);
+});
+
+app.listen(5000, () => {
+  console.log("Server running on port 5000");
+});
+
+
+
+{
+  "task": "Learn React",
+  "priority": "Low",
+  "completed": false
+}
